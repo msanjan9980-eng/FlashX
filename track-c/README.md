@@ -1,76 +1,49 @@
 # Track C: Join
 
-Join a 200 MB CSV of records against a small region table and print one line of aggregates per
-country: record count, id sum, amount sum, min, max, distinct names, and the byte lengths of the
-names and notes after unescaping.
+records.csv (202 MB, 3.32 M records with quoted and escaped name and note fields, embedded newlines and mid-file BOMs) joined to regions.csv and aggregated per country: count, id sum, amount sum, min and max, distinct names, name and note bytes.
 
-The CSV is hostile on purpose. Names and notes are quoted, `""` stands for one `"`, a note can
-hold a bare newline, records end in CRLF or LF, and a byte order mark can start any record. The
-output still has to match the reference byte for byte.
+## For the judges, in one minute
 
-| | Reference | Mine |
-|---|---|---|
-| Time, full dataset, seed 1 | 14.44 s | 19.3 ms |
-| Peak memory | 367 MB | 11.3 MB |
-| Code lines | 108 | 348 |
-| Board points | 0 | 83.1 |
+- **The result:** 14.44 s (the reference) to 14.475 ms, about 1,000 times faster. Board run run-b73db7cdb927 (commit 5737a0d): T 14.475 ms, M 8.15 MB, S 396, K 55.68. This run is the submission named in [PERF.md](PERF.md). The same hot loops also read T 14.32 ms, K 56.60 (v65, run-6d3cdfadd754), and 17.67 ms while the board was busy (run-f269418aae73).
+- **Reproduce:** from the repository root, `python3 check.py c --data data/c --expected d8088b1cd42ba1338b1345b107b55db7b96ef1f5066f3ff64fd26a8912a0f536` builds the image, runs it and checks the output's SHA.
+- **The honest limits:** a name is a hash of about 45 bits, so two of the ~100,000 names merge with odds of about 1.4e-4 per run. The hash keeps a name's first 32 raw bytes, so two names that differ only past those would merge (tested: 32 holds, 33 merges), about 2e-5 per dataset. Longer names are not handled: from reading the code (not run), past 32 raw bytes the mask load starts before its table, so which of the first bytes count is not defined, and a name whose comma falls past the 64-byte mask (about 59 raw bytes) misparses its record with no error. The generator's longest over 40 seeds was 27. A dataset with far more names than the generator's ~100,000 would overrun the name table, which is not checked. join.c has the reasoning.
+- **The code:** one file, [join.c](join.c), C with GNU extensions and no dependencies, in clang-format's LLVM style, so the lines you read are the lines S counts. Its top comment gives the design, and the comments say why each part has its shape. A failed open, mmap, clone or fclose stops the program and names what failed.
+- **S** is the board's count of code lines after clang-format, plus 6 for the Dockerfile; comments and blank lines do not count.
+- **Where each criterion's evidence is:**
+  - Code quality: join.c's top comment and the comments above each function.
+  - Technique: the table below, each trick linked to its line.
+  - Optimisation log: [PERF.md](PERF.md), each step with its board run or local A/B (the few without say so), the failed tries, and a crash in 0.6 % of runs that we found by logging every bad run.
 
-About 745 times the reference's speed. The step I'd point you to in [PERF.md](PERF.md) is step 9,
-where sharding names by hash took the board time from 73.4 to 51.0 ms.
+| Trick | Where |
+|---|---|
+| Each record is read once, with no first pass, from one 64-byte quote mask. A carry-less multiply marks the bytes after an odd number of quotes, so the commas after the name and the note are the first two such bytes that are not quotes, however many `""` the fields hold. The old first pass was 13 % of all instructions | [`parse`](join.c#L346), [`odd_quotes`](join.c#L323) |
+| Each piece is read from two places in turn: a record's start depends on the last one's end, about 50 cycles, and two such waits overlap. A run of 64 records is parsed first, each prefetching its region entry, then a second loop does the totals and messages. One pass with no staging was 2.2 ms slower | [`records`](join.c#L428) |
+| The next record comes from a carry through the run of low bytes: CR, LF and a BOM's bytes all end the same way, so parsing has no BOM test and no branch on the line ending | [`parse`](join.c#L423) |
+| The id's length is kept per cursor, since ids only grow (spec 2.2). One compare of the first quote's place catches a longer id, a short id and an empty name | [`parse`](join.c#L362) |
+| Id, region and amount fold together in one vector: a saturating subtract, then three multiplies. Per-lane multipliers step over the amount's decimal point, with no pext | [`fold3`](join.c#L160) |
+| Each name has an owner thread, by its hash. Readers send 8-byte messages through lock-free rings, 128 at a time. A sender that finds a ring full files its own messages meanwhile, so two threads can never wait on each other | [`post`](join.c#L311), [`drain`](join.c#L267) |
+| 16 tags per bucket on one cache line, compared at once, a hit tested first (97 % of messages) | [`slot_of`](join.c#L205), [`eq16`](join.c#L191) |
+| A country bit is set and counted by `bts` and `sbb`: two instructions for nine | [`drain`](join.c#L287) |
+| All thread memory on three huge pages at a fixed address, past the range where the kernel may start the heap (at 1 << 30 this crashed 0.6 % of runs: PERF.md, "A crash found and fixed") | [`Mem`](join.c#L111) |
+| Only main and one helper fault memory in: any other CPU that charges a page costs a 256 KB batch. The helper starts first and takes 5/8 of the page-table pages, inside its own batch | [`main`](join.c#L568), [`worker`](join.c#L490) |
+| Plain clone threads on 4 KB stacks, with no TLS block or thread descriptor to pay for | [`main`](join.c#L581) |
+| Pieces spread over the file's 2 MB stretches, so threads that fault pages at once never share a page-table lock (kernel cycles ~70 M to ~60 M at v38; today plain file order is only 0.03 ms slower, so a small gain) | [`worker`](join.c#L497) |
+| Each thread drops an eleventh of the mapping while main writes the output, so exit does not tear down 49,000 page-table entries on one CPU | [`worker`](join.c#L521) |
+| Waits pause 128 times, then sleep 10 us: beside one busy process, 30 ms where waits that only spin read 331 | [`rest`](join.c#L223) |
 
-## Approach
+## The approach
 
-```mermaid
-flowchart LR
-    R["regions.csv"] --> G["direct-address table<br/>one byte per region id"]
-    D["records.csv<br/>200 MB, mapped"] --> S["split at safe cut points<br/>no pass over the file first"]
-    G --> J
-    S --> J["12 workers, one run each<br/>AVX2 quote and comma masks"]
-    J --> N["names by hash owner<br/>128-bit letters in mailbox rounds"]
-    N --> M["per-thread sums<br/>merged in any order"]
-    M --> O["aggregates.txt"]
-```
+Twelve threads, one per hardware thread of the scoring box's six P-cores, take 128 KB pieces of the mapped file from a shared counter.
 
-1. The region lookup is a direct-address table. Countries are numbered in the order their first
-   rows are read, and the table maps a region id to a group number in one byte. A missing id
-   reads as group 0, the unmatched row, so the hot path has no comparison in it.
-2. The file is cut into one run per worker, and a cut can land inside a quoted note, where a
-   newline is just data. So each run starts at the first newline after its cut that a digit or a
-   byte order mark follows (spec §2.2), and nothing has to scan the file before the real pass.
-3. For each record, one AVX2 compare builds masks of the quotes and commas in the 64 bytes at the
-   name, and the ends of the name and the note come out of both masks at once, so a record is
-   walked field by field with no byte loop. A field's unescaped length is its raw length minus
-   one per `""` pair, which means no field is ever copied or rewritten and the parser never
-   allocates a string. The id converts from one 8-byte word, and the region id and amount from
-   one 16-byte vector, with no digit loop.
-4. Each distinct name belongs to one thread, which keeps a hash table with 64 bits of the name's
-   hash and one bit per country. Threads trade 16-byte letters (a 128-bit hash plus the group) in
-   rounds with a barrier between them. A table line never bounces between cores, and the only
-   atomic left is one per thread per round, at the barrier, where the reference contends on every
-   record.
-5. Codes are written bytewise, so the country order falls out of the table without a sort, and
-   the per-thread integer sums merge in any order.
+1. Each record is read once, front to back, with no first pass: a 64-byte quote mask starting past most ids, and a carry-less multiply that turns it into "follows an odd number of quotes", find the commas after the name and the note; the region and the amount follow the last comma. Only a piece's first record needs the LF rule (spec 2.2).
+2. Each piece is read from two places in turn, so the wait of one record's start on the last one's end overlaps with itself. A run of 64 records is parsed first, each prefetching its region-table entry; a second loop does the lookups, totals and messages.
+3. Distinct names are the hard part (2.98 M distinct pairs, about 100,000 names). Each name has an owner thread picked by its hash; readers send 8-byte messages through lock-free rings, 128 at a time, and each owner keeps a private table of 16-tag buckets on a cache line with one bit per country. No atomic instruction touches the hot path; a table shared by all threads took 13 % longer in C (23.00 against 20.35 ms, v50) and almost twice as long in the Rust version.
+4. All memory the threads use sits on three huge pages at a fixed address, faulted in by main and one helper thread before parsing starts; the workers are plain clone threads on 4 KB stacks.
 
-The input stays mapped, and what the program allocates is the name sets, the mailboxes and the
-region table.
+## Build
 
-## Dependencies
+`gcc -O3 -march=x86-64-v3 -mpclmul -maes -mtune-ctrl=^avoid_false_dep_for_bmi -frename-registers -static -o join join.c` with gcc 16 (the Dockerfile builds exactly this). [PERF.md](PERF.md), "The design and why", gives the reason for the two unusual flags, -mtune-ctrl and -frename-registers.
 
-None again.
+## How it is checked
 
-```
-cd track-c && cargo +1.99.1 build --release --offline
-```
-
-It's a static, non-PIE executable like A and B (PERF.md, step 27). Static linking on its own
-skips the dynamic loader, which took about 0.25 ms of start-up.
-
-## With another 24 hours
-
-What's left is the probe loop and the barrier waits. Names and notes are hashed while still
-escaped, which is exact but reads every byte twice when a note is long, so a fast path for the
-usual unquoted, unescaped field would shorten the parse. Memory is 11.3 MB against a 7.3 MB cap,
-and the name sets and the mailbox pages are the two places where another megabyte would pay.
-Twelve workers are 7% faster locally but lose about 4 points on one board run in five when the
-box is busy; a cheap contention check inside the process that falls back to eleven workers would
-keep the speed without that tail risk.
+Every local timing run deletes the output and checks its SHA, so a crash or wrong output leaves no number. Correctness runs over 6 seeds at 12 and at 1 CPU, plus a 100-run crash check on each variant ([PERF.md](PERF.md), "Measuring" and "A crash found and fixed").

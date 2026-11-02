@@ -4,8 +4,8 @@ This repository contains our optimized submissions for all four tracks of the Sp
 
 ## Team & Tech Stack
 *   **Team Name:** Deploy or Die
-*   **Language:** Rust
-*   **Dependencies:** Exactly 1 (`libc`)
+*   **Language:** Rust (A), C (B, C, D)
+*   **Dependencies:** 0 (standard library only)
 
 ## Core Architecture & Optimizations
 Across all tracks, we applied low-level systems engineering techniques to achieve maximum performance, leaving behind the standard Python implementations.
@@ -26,3 +26,4 @@ Each track is containerized. The board builds them offline using Docker. To test
 
 ```bash
 python3 check.py <track_letter> --data data/<track_letter>
+
