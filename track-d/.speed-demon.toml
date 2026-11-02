@@ -1,5 +1,4 @@
-# Read by the board and the scoring harness.
 track = "d"
-team = "Cause Of Death"
+team = "Deploy or Die"
 language = "Rust"
-dependency_count = 0
+dependency_count = 1
